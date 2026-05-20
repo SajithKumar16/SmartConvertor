@@ -127,7 +127,8 @@ const Hero = () => {
       formData.append('file', files[0]);
     }
 
-    let endpoint = 'http://localhost:3001/api/convert';
+    const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+    let endpoint = `${API_BASE_URL}/api/convert`;
     
     if (action === 'image') {
       formData.append('targetFormat', imageFormat);
