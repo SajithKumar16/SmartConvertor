@@ -121,6 +121,48 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       // Basic compression by rebuilding the PDF structure
       convertedBuffer = Buffer.from(await pdfDoc.save());
       mimeType = 'application/pdf';
+    } else if (targetFormat === 'pdf-to-docx') {
+      if (extension !== '.pdf') {
+        return res.status(400).json({ error: 'Please upload a valid PDF file to convert.' });
+      }
+      newExtension = 'docx';
+      const { PdfReader } = require("pdfreader");
+      const extractedText = await new Promise((resolve, reject) => {
+        let textContent = "";
+        let lastY = null;
+        new PdfReader().parseBuffer(buffer, (err, item) => {
+          if (err) {
+            reject(err);
+          } else if (!item) {
+            resolve(textContent.trim() || "No text content found in PDF.");
+          } else if (item.text) {
+            // Group text on similar vertical lines together
+            if (lastY !== null && Math.abs(item.y - lastY) > 0.5) {
+              textContent += "\n";
+            }
+            textContent += item.text + " ";
+            lastY = item.y;
+          }
+        });
+      });
+      
+      const htmlContent = `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body { font-family: "Calibri", "Arial", sans-serif; line-height: 1.5; font-size: 11pt; }
+p { margin-bottom: 8pt; text-align: justify; }
+</style>
+</head>
+<body>
+${extractedText.split('\n').map(line => line.trim() ? `<p>${line.trim()}</p>` : '').join('')}
+</body>
+</html>
+      `;
+      convertedBuffer = Buffer.from(htmlContent, 'utf-8');
+      mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     } else {
       // For PDF/DOCX we will mock it for now
       return res.status(501).json({ error: `Conversion to ${targetFormat} is currently mocked or unsupported in this lightweight build.` });
