@@ -126,18 +126,66 @@ const upload = multer({
   limits: { fileSize: 100 * 1024 * 1024 } // 100MB
 });
 
-// Shared helper: Sanitize text for WinAnsi PDF font & render paginated A4 PDF
-async function renderTextToPdfBuffer(rawText) {
-  const pdfDoc = await PDFDocument.create();
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-
-  let text = (rawText || '').replace(/^\uFEFF/, '');
-  text = text
+// Shared helper: Sanitize text against the actual WinAnsi font encoder & render paginated A4 PDF
+function sanitizeForPdfFont(rawText, font) {
+  const normalized = (rawText || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\t/g, '    ')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\u200B-\u200D\u00AD\u2028\u2029]/g, '')
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201C\u201D]/g, '"')
     .replace(/[\u2013\u2014]/g, '-')
-    .replace(/\u2026/g, '...')
-    .replace(/[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF]/g, ' ');
+    .replace(/\u2026/g, '...');
+
+  const validCharCache = new Map();
+  let safe = '';
+  for (const ch of normalized) {
+    if (ch === '\n' || ch === '\r') {
+      safe += ch;
+      continue;
+    }
+    let ok = validCharCache.get(ch);
+    if (ok === undefined) {
+      try {
+        font.encodeText(ch);
+        ok = true;
+      } catch {
+        ok = false;
+      }
+      validCharCache.set(ch, ok);
+    }
+    safe += ok ? ch : ' ';
+  }
+  return safe;
+}
+
+function extractReadableTextFromHtmlOrPlain(rawBuffer) {
+  const content = rawBuffer.toString('utf-8');
+  if (/<html|<body|<p|<div|<br/i.test(content)) {
+    return content
+      .replace(/<head[\s\S]*?<\/head>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<(?:br|\/p|\/div|\/tr|\/li|\/h[1-6])\b[^>]*>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;/gi, "'")
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+  return content.trim();
+}
+
+async function renderTextToPdfBuffer(rawText) {
+  const pdfDoc = await PDFDocument.create();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const text = sanitizeForPdfFont(rawText, font);
 
   const rawLines = text.split(/\r?\n/);
   let page = pdfDoc.addPage([595.28, 841.89]); // A4
@@ -146,6 +194,15 @@ async function renderTextToPdfBuffer(rawText) {
   const fontSize = 10.5;
   const lineHeight = 15;
   const maxWidth = 595.28 - margin * 2;
+
+  const writeLine = (lineStr) => {
+    if (y < margin) {
+      page = pdfDoc.addPage([595.28, 841.89]);
+      y = 790;
+    }
+    page.drawText(lineStr, { x: margin, y, size: fontSize, font, color: rgb(0.12, 0.12, 0.12) });
+    y -= lineHeight;
+  };
 
   for (const rawLine of rawLines) {
     if (!rawLine.trim()) {
@@ -161,36 +218,54 @@ async function renderTextToPdfBuffer(rawText) {
     let line = '';
     for (const word of words) {
       const testLine = line ? `${line} ${word}` : word;
-      const textWidth = font.widthOfTextAtSize(testLine, fontSize);
-      if (textWidth > maxWidth && line) {
-        if (y < margin) {
-          page = pdfDoc.addPage([595.28, 841.89]);
-          y = 790;
+      if (font.widthOfTextAtSize(testLine, fontSize) > maxWidth) {
+        if (line) {
+          writeLine(line);
+          line = '';
         }
-        page.drawText(line, { x: margin, y, size: fontSize, font, color: rgb(0.12, 0.12, 0.12) });
-        y -= lineHeight;
-        line = word;
+        // Handle single ultra-long words/URLs wider than maxWidth
+        if (font.widthOfTextAtSize(word, fontSize) > maxWidth) {
+          let chunk = '';
+          for (const ch of word) {
+            if (font.widthOfTextAtSize(chunk + ch, fontSize) > maxWidth && chunk) {
+              writeLine(chunk);
+              chunk = ch;
+            } else {
+              chunk += ch;
+            }
+          }
+          line = chunk;
+        } else {
+          line = word;
+        }
       } else {
         line = testLine;
       }
     }
     if (line) {
-      if (y < margin) {
-        page = pdfDoc.addPage([595.28, 841.89]);
-        y = 790;
-      }
-      page.drawText(line, { x: margin, y, size: fontSize, font, color: rgb(0.12, 0.12, 0.12) });
-      y -= lineHeight;
+      writeLine(line);
     }
   }
 
   return Buffer.from(await pdfDoc.save());
 }
 
-// Helper: Convert DOCX to PDF (Python docx2pdf on Windows if available, pure Node mammoth + pdf-lib everywhere)
+// Helper: Convert DOCX to PDF (supports standard ZIP OOXML .docx, HTML-saved .docx, and local Word)
 async function convertDocxToPdf(docxBuffer) {
+  const isZipDocx = docxBuffer.length >= 2 && docxBuffer[0] === 0x50 && docxBuffer[1] === 0x4b; // 'PK'
+  const isLegacyBinaryDoc =
+    docxBuffer.length >= 4 &&
+    docxBuffer[0] === 0xd0 &&
+    docxBuffer[1] === 0xcf &&
+    docxBuffer[2] === 0x11 &&
+    docxBuffer[3] === 0xe0;
+
+  if (isLegacyBinaryDoc) {
+    throw new Error('Legacy binary .doc files are not supported in cloud mode. Please save as modern .docx and retry.');
+  }
+
   const pythonExe = path.join(__dirname, 'venv', 'Scripts', 'python.exe');
-  if (fs.existsSync(pythonExe)) {
+  if (isZipDocx && fs.existsSync(pythonExe)) {
     const tempDir = os.tmpdir();
     const uniqueId = `docx_${Date.now()}_${Math.random().toString(36).substring(7)}`;
     const inPath = path.join(tempDir, `${uniqueId}.docx`);
@@ -215,12 +290,21 @@ convert(r"${inPath.replace(/\\/g, '\\\\')}", r"${outPath.replace(/\\/g, '\\\\')}
     }
   }
 
-  // Cross-platform pure Node.js conversion using mammoth + pdf-lib
-  const result = await mammoth.extractRawText({ buffer: docxBuffer });
-  const text = result.value && result.value.trim()
-    ? result.value
-    : 'Document converted from DOCX (empty text content).';
-  return await renderTextToPdfBuffer(text);
+  let text = '';
+  if (isZipDocx) {
+    try {
+      const result = await mammoth.extractRawText({ buffer: docxBuffer });
+      text = result.value || '';
+    } catch (err) {
+      console.warn('Mammoth failed, falling back to HTML/plain parser:', err.message);
+      text = extractReadableTextFromHtmlOrPlain(docxBuffer);
+    }
+  } else {
+    // Handle HTML-exported .docx files (e.g. legacy pdf-to-docx exports) or plain-text .docx
+    text = extractReadableTextFromHtmlOrPlain(docxBuffer);
+  }
+
+  return await renderTextToPdfBuffer(text.trim() || 'Document converted from DOCX (no text content).');
 }
 
 // Helper: Convert PDF to DOCX (Python pdf2docx if available, pure Node pdfreader + docx everywhere)
@@ -353,8 +437,16 @@ app.post('/api/convert', upload.any(), async (req, res) => {
       }
       newExtension = 'txt';
       const Tesseract = require('tesseract.js');
-      const { data: { text } } = await Tesseract.recognize(buffer, 'eng', { cachePath: writableBaseDir });
-      convertedBuffer = Buffer.from(text || 'No text recognized.', 'utf-8');
+      const pngBuffer = await sharp(buffer).png().toBuffer();
+      const worker = await Tesseract.createWorker('eng', 1, {
+        cachePath: writableBaseDir
+      });
+      try {
+        const { data: { text } } = await worker.recognize(pngBuffer);
+        convertedBuffer = Buffer.from((text && text.trim()) ? text : 'No text recognized.', 'utf-8');
+      } finally {
+        await worker.terminate();
+      }
       mimeType = 'text/plain; charset=utf-8';
     }
     // 4. Compress PDF

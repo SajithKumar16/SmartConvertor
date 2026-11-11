@@ -252,6 +252,73 @@ const Hero = () => {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const finalizeConversion = async (blob, filename, rawPreviewUrl = '') => {
+    const blobUrl = window.URL.createObjectURL(blob);
+    const safePreviewUrl = resolveSafePreviewUrl(rawPreviewUrl);
+    const isTextOutput = blob.type.startsWith('text/') || filename.toLowerCase().endsWith('.txt');
+    let textContent = '';
+    if (isTextOutput) {
+      try {
+        textContent = await blob.text();
+      } catch (e) {}
+    }
+
+    const conversionDate = new Date().toISOString();
+
+    saveSessionPreview(conversionDate, {
+      url: blobUrl,
+      filename,
+      type: blob.type,
+      textContent
+    });
+
+    setConvertedResult({
+      blob,
+      url: blobUrl,
+      filename,
+      type: blob.type,
+      textContent,
+      previewUrl: safePreviewUrl || blobUrl,
+      size: formatFileSize(blob.size)
+    });
+    setConversionProgress(100);
+
+    // Trigger automatic direct download for immediate gratification
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    // Save to local storage for Dashboard fallback
+    const history = JSON.parse(localStorage.getItem('conversions') || '[]');
+    let displayTarget = action.toUpperCase();
+    if (action === 'image') displayTarget = imageFormat.toUpperCase();
+    else if (action.includes('-to-')) displayTarget = action.split('-to-')[1].toUpperCase();
+
+    const conversionData = {
+      name: selectedFiles.length > 1 ? `${selectedFiles.length} files merged` : selectedFiles[0].name,
+      to: displayTarget,
+      size: selectedFiles.length > 1 ? 'Multiple' : formatFileSize(selectedFiles[0].size),
+      status: 'Completed',
+      date: conversionDate,
+      url: safePreviewUrl || ''
+    };
+
+    history.unshift(conversionData);
+    localStorage.setItem('conversions', JSON.stringify(history.slice(0, 15)));
+    window.dispatchEvent(new Event('conversionUpdated'));
+
+    // Save to Firestore if user logged in
+    if (auth.currentUser) {
+      addDoc(collection(db, `users/${auth.currentUser.uid}/conversions`), {
+        ...conversionData,
+        timestamp: serverTimestamp()
+      }).catch(err => console.error("Firestore sync error: ", err));
+    }
+  };
+
   const handleConvert = async () => {
     if (selectedFiles.length === 0) {
       fileInputRef.current?.click();
@@ -265,7 +332,45 @@ const Hero = () => {
 
     setIsConverting(true);
     setErrorMessage('');
-    setConversionProgress(20);
+    setConversionProgress(15);
+
+    // Run OCR directly in the browser Web Worker for instant live progress & zero serverless timeouts
+    if (action === 'ocr') {
+      try {
+        const file = selectedFiles[0];
+        const ext = '.' + (file.name.split('.').pop()?.toLowerCase() || '');
+        if (!['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'].includes(ext)) {
+          throw new Error('OCR supports image formats (JPG, PNG, WEBP, BMP).');
+        }
+
+        const { createWorker } = await import('tesseract.js');
+        setConversionProgress(25);
+        const worker = await createWorker('eng', 1, {
+          logger: (m) => {
+            if (m.status === 'recognizing text' && typeof m.progress === 'number') {
+              setConversionProgress(Math.min(95, Math.round(30 + m.progress * 65)));
+            }
+          }
+        });
+
+        let extractedText = '';
+        try {
+          const { data: { text } } = await worker.recognize(file);
+          extractedText = (text && text.trim()) ? text : 'No text recognized in this image.';
+        } finally {
+          await worker.terminate();
+        }
+
+        const baseName = file.name.replace(/\.[^/.]+$/, '');
+        const blob = new Blob([extractedText], { type: 'text/plain; charset=utf-8' });
+        await finalizeConversion(blob, `${baseName}_converted.txt`);
+      } catch (err) {
+        setErrorMessage(err.message || 'OCR text extraction failed.');
+      } finally {
+        setIsConverting(false);
+      }
+      return;
+    }
 
     const progressInterval = setInterval(() => {
       setConversionProgress(prev => {
@@ -282,7 +387,7 @@ const Hero = () => {
     }
 
     const API_BASE_URL = getApiBaseUrl();
-    let endpoint = `${API_BASE_URL}/api/convert`;
+    const endpoint = `${API_BASE_URL}/api/convert`;
 
     if (action === 'image') {
       formData.append('targetFormat', imageFormat);
@@ -290,12 +395,17 @@ const Hero = () => {
       formData.append('targetFormat', action);
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 55000);
+
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
         body: formData,
+        signal: controller.signal
       });
 
+      clearTimeout(timeoutId);
       clearInterval(progressInterval);
       setConversionProgress(95);
 
@@ -309,8 +419,6 @@ const Hero = () => {
       }
 
       const blob = await response.blob();
-      const blobUrl = window.URL.createObjectURL(blob);
-      
       const contentDisposition = response.headers.get('Content-Disposition');
       let filename = 'converted_file';
       if (contentDisposition && contentDisposition.includes('filename="')) {
@@ -326,73 +434,16 @@ const Hero = () => {
       }
 
       const rawPreviewUrl = response.headers.get('X-Preview-URL');
-      const safePreviewUrl = resolveSafePreviewUrl(rawPreviewUrl);
-      const isTextOutput = blob.type.startsWith('text/') || filename.toLowerCase().endsWith('.txt');
-      let textContent = '';
-      if (isTextOutput) {
-        try {
-          textContent = await blob.text();
-        } catch (e) {}
-      }
-
-      const conversionDate = new Date().toISOString();
-
-      saveSessionPreview(conversionDate, {
-        url: blobUrl,
-        filename,
-        type: blob.type,
-        textContent
-      });
-
-      setConvertedResult({
-        blob,
-        url: blobUrl,
-        filename,
-        type: blob.type,
-        textContent,
-        previewUrl: safePreviewUrl || blobUrl,
-        size: formatFileSize(blob.size)
-      });
-      setConversionProgress(100);
-
-      // Trigger automatic direct download for immediate gratification
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-
-      // Save to local storage for Dashboard fallback
-      const history = JSON.parse(localStorage.getItem('conversions') || '[]');
-      let displayTarget = action.toUpperCase();
-      if (action === 'image') displayTarget = imageFormat.toUpperCase();
-      else if (action.includes('-to-')) displayTarget = action.split('-to-')[1].toUpperCase();
-
-      const conversionData = {
-        name: selectedFiles.length > 1 ? `${selectedFiles.length} files merged` : selectedFiles[0].name,
-        to: displayTarget,
-        size: selectedFiles.length > 1 ? 'Multiple' : formatFileSize(selectedFiles[0].size),
-        status: 'Completed',
-        date: conversionDate,
-        url: safePreviewUrl || ''
-      };
-
-      history.unshift(conversionData);
-      localStorage.setItem('conversions', JSON.stringify(history.slice(0, 15)));
-      window.dispatchEvent(new Event('conversionUpdated'));
-
-      // Save to Firestore if user logged in
-      if (auth.currentUser) {
-        addDoc(collection(db, `users/${auth.currentUser.uid}/conversions`), {
-          ...conversionData,
-          timestamp: serverTimestamp()
-        }).catch(err => console.error("Firestore sync error: ", err));
-      }
+      await finalizeConversion(blob, filename, rawPreviewUrl);
 
     } catch (err) {
+      clearTimeout(timeoutId);
       clearInterval(progressInterval);
-      setErrorMessage(err.message || 'An error occurred during conversion.');
+      if (err.name === 'AbortError') {
+        setErrorMessage('Request timed out. Please try again with a smaller file.');
+      } else {
+        setErrorMessage(err.message || 'An error occurred during conversion.');
+      }
     } finally {
       setIsConverting(false);
     }
