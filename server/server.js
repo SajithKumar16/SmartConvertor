@@ -17,7 +17,9 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(cors({ exposedHeaders: ['Content-Disposition', 'X-Preview-URL'] }));
 app.use(express.json());
-app.use('/downloads', express.static(path.join(__dirname, 'downloads')));
+const writableBaseDir = process.env.VERCEL ? os.tmpdir() : __dirname;
+const downloadsDir = path.join(writableBaseDir, 'downloads');
+app.use('/downloads', express.static(downloadsDir));
 require('dotenv').config();
 const nodemailer = require('nodemailer');
 
@@ -88,7 +90,7 @@ app.post('/api/contact', async (req, res) => {
 
   // Record messages locally for resilience
   try {
-    const messagesFile = path.join(__dirname, 'contact_messages.json');
+    const messagesFile = path.join(writableBaseDir, 'contact_messages.json');
     let messages = [];
     if (fs.existsSync(messagesFile)) {
       try {
@@ -351,7 +353,7 @@ app.post('/api/convert', upload.any(), async (req, res) => {
       }
       newExtension = 'txt';
       const Tesseract = require('tesseract.js');
-      const { data: { text } } = await Tesseract.recognize(buffer, 'eng');
+      const { data: { text } } = await Tesseract.recognize(buffer, 'eng', { cachePath: writableBaseDir });
       convertedBuffer = Buffer.from(text || 'No text recognized.', 'utf-8');
       mimeType = 'text/plain; charset=utf-8';
     }
@@ -442,7 +444,6 @@ app.post('/api/convert', upload.any(), async (req, res) => {
     const baseName = targetFormat === 'merge-pdf' ? 'merged_documents' : path.parse(originalName).name;
     const newFileName = `${baseName}_converted.${newExtension}`;
 
-    const downloadsDir = path.join(__dirname, 'downloads');
     if (!fs.existsSync(downloadsDir)) {
       fs.mkdirSync(downloadsDir, { recursive: true });
     }
@@ -471,6 +472,10 @@ app.post('/api/convert', upload.any(), async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Conversion server running on port ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Conversion server running on port ${PORT}`);
+  });
+}
+
+module.exports = app;

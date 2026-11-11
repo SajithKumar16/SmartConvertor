@@ -21,7 +21,7 @@ import {
 import { auth, db } from '../firebase';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import PreviewModal from './PreviewModal';
-import { saveSessionPreview, resolveSafePreviewUrl } from '../utils/previewHelper';
+import { saveSessionPreview, resolveSafePreviewUrl, getApiBaseUrl } from '../utils/previewHelper';
 
 const TOOL_OPTIONS = [
   { value: 'image', label: 'Image Converter', desc: 'Convert JPG, PNG, WEBP', icon: ImageIcon },
@@ -281,7 +281,7 @@ const Hero = () => {
       formData.append('file', selectedFiles[0]);
     }
 
-    const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+    const API_BASE_URL = getApiBaseUrl();
     let endpoint = `${API_BASE_URL}/api/convert`;
 
     if (action === 'image') {

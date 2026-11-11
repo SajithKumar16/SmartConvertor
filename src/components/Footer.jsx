@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Sparkles, Globe, Mail, MessageCircle, Send, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Globe, Mail, MessageCircle, Send, CheckCircle2, AlertCircle } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { getApiBaseUrl } from '../utils/previewHelper';
 
 const Footer = () => {
   const [status, setStatus] = useState('');
@@ -17,7 +18,7 @@ const Footer = () => {
     setStatus('Sending...');
 
     try {
-      const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+      const API_BASE_URL = getApiBaseUrl();
       const response = await fetch(`${API_BASE_URL}/api/contact`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
