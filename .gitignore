@@ -30,6 +30,8 @@ server/.env
 server/node_modules
 server/downloads
 server/venv
+server/contact_messages.json
+server/eng.traineddata
 __pycache__
 .firebase
 dist
