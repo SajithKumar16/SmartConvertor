@@ -20,6 +20,8 @@ import {
 } from 'lucide-react';
 import { auth, db } from '../firebase';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import PreviewModal from './PreviewModal';
+import { saveSessionPreview, resolveSafePreviewUrl } from '../utils/previewHelper';
 
 const TOOL_OPTIONS = [
   { value: 'image', label: 'Image Converter', desc: 'Convert JPG, PNG, WEBP', icon: ImageIcon },
@@ -189,6 +191,8 @@ const Hero = () => {
   const [conversionProgress, setConversionProgress] = useState(0);
   const [convertedResult, setConvertedResult] = useState(null);
   const [errorMessage, setErrorMessage] = useState('');
+  const [previewModalOpen, setPreviewModalOpen] = useState(false);
+  const [previewModalData, setPreviewModalData] = useState(null);
   const fileInputRef = useRef(null);
 
   // Allow external triggers (e.g. from ConverterGrid) to change tool
@@ -321,13 +325,32 @@ const Hero = () => {
         filename = `converted_${Date.now()}.${ext}`;
       }
 
-      const previewUrl = response.headers.get('X-Preview-URL');
+      const rawPreviewUrl = response.headers.get('X-Preview-URL');
+      const safePreviewUrl = resolveSafePreviewUrl(rawPreviewUrl);
+      const isTextOutput = blob.type.startsWith('text/') || filename.toLowerCase().endsWith('.txt');
+      let textContent = '';
+      if (isTextOutput) {
+        try {
+          textContent = await blob.text();
+        } catch (e) {}
+      }
+
+      const conversionDate = new Date().toISOString();
+
+      saveSessionPreview(conversionDate, {
+        url: blobUrl,
+        filename,
+        type: blob.type,
+        textContent
+      });
 
       setConvertedResult({
         blob,
         url: blobUrl,
         filename,
-        previewUrl,
+        type: blob.type,
+        textContent,
+        previewUrl: safePreviewUrl || blobUrl,
         size: formatFileSize(blob.size)
       });
       setConversionProgress(100);
@@ -351,8 +374,8 @@ const Hero = () => {
         to: displayTarget,
         size: selectedFiles.length > 1 ? 'Multiple' : formatFileSize(selectedFiles[0].size),
         status: 'Completed',
-        date: new Date().toISOString(),
-        url: previewUrl || ''
+        date: conversionDate,
+        url: safePreviewUrl || ''
       };
 
       history.unshift(conversionData);
@@ -606,17 +629,22 @@ const Hero = () => {
                         <span>Download Converted File</span>
                       </a>
 
-                      {convertedResult.previewUrl && (
-                        <a 
-                          href={convertedResult.previewUrl} 
-                          target="_blank" 
-                          rel="noreferrer"
-                          className="btn-secondary preview-btn"
-                        >
-                          <Eye size={16} />
-                          <span>Preview</span>
-                        </a>
-                      )}
+                      <button 
+                        type="button"
+                        onClick={() => {
+                          setPreviewModalData({
+                            url: convertedResult.url,
+                            filename: convertedResult.filename,
+                            type: convertedResult.type,
+                            textContent: convertedResult.textContent
+                          });
+                          setPreviewModalOpen(true);
+                        }}
+                        className="btn-secondary preview-btn"
+                      >
+                        <Eye size={16} />
+                        <span>Preview</span>
+                      </button>
 
                       <button 
                         type="button"
@@ -684,6 +712,12 @@ const Hero = () => {
           </div>
         </div>
       </div>
+
+      <PreviewModal
+        isOpen={previewModalOpen}
+        onClose={() => setPreviewModalOpen(false)}
+        previewData={previewModalData}
+      />
 
       <style>{`
         .hero-section {

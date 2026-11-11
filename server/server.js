@@ -10,17 +10,50 @@ const util = require('util');
 const execFileAsync = util.promisify(execFile);
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 const JSZip = require('jszip');
+const mammoth = require('mammoth');
+const { Document, Packer, Paragraph, TextRun } = require('docx');
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(cors({ exposedHeaders: ['Content-Disposition', 'X-Preview-URL'] }));
 app.use(express.json());
 app.use('/downloads', express.static(path.join(__dirname, 'downloads')));
 require('dotenv').config();
 const nodemailer = require('nodemailer');
 
+const SUPPORTED_TOOLS = [
+  'image',
+  'img-to-pdf',
+  'pdf-to-docx',
+  'docx-to-pdf',
+  'txt-to-pdf',
+  'compress-pdf',
+  'merge-pdf',
+  'split-pdf',
+  'ocr'
+];
+
+// Health & root status endpoints
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'SmartConvert API',
+    version: '2.5.0',
+    supportedFormats: SUPPORTED_TOOLS
+  });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    version: '2.5.0',
+    supportedFormats: SUPPORTED_TOOLS
+  });
+});
+
 app.post('/api/contact', async (req, res) => {
   const { email, subject, message } = req.body;
-  
+
   if (!email || !message) {
     return res.status(400).json({ error: 'Please provide both your email address and message.' });
   }
@@ -53,7 +86,7 @@ app.post('/api/contact', async (req, res) => {
     }
   }
 
-  // Always record messages to server/contact_messages.json to guarantee zero data loss
+  // Record messages locally for resilience
   try {
     const messagesFile = path.join(__dirname, 'contact_messages.json');
     let messages = [];
@@ -76,108 +109,181 @@ app.post('/api/contact', async (req, res) => {
     console.error('Failed to save contact message locally:', err);
   }
 
-  res.json({ 
-    success: true, 
-    message: emailDelivered 
-      ? 'Message sent successfully! Our team will respond shortly.' 
-      : 'Message received and saved! We will get in touch shortly.' 
+  res.json({
+    success: true,
+    message: emailDelivered
+      ? 'Message sent successfully! Our team will respond shortly.'
+      : 'Message received and saved! We will get in touch shortly.'
   });
 });
 
 // Set up storage with upload.any() to handle both 'file' and 'files'
 const storage = multer.memoryStorage();
-const upload = multer({ 
+const upload = multer({
   storage: storage,
   limits: { fileSize: 100 * 1024 * 1024 } // 100MB
 });
 
-// Helper: Python execution for docx2pdf
-async function convertDocxToPdf(docxBuffer) {
-  const tempDir = os.tmpdir();
-  const uniqueId = `docx_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  const inPath = path.join(tempDir, `${uniqueId}.docx`);
-  const outPath = path.join(tempDir, `${uniqueId}.pdf`);
-  fs.writeFileSync(inPath, docxBuffer);
-  
-  const pythonExe = path.join(__dirname, 'venv', 'Scripts', 'python.exe');
-  const pyCode = `
-import sys
-from docx2pdf import convert
-convert(r"${inPath.replace(/\\/g, '\\\\')}", r"${outPath.replace(/\\/g, '\\\\')}")
-  `.trim();
+// Shared helper: Sanitize text for WinAnsi PDF font & render paginated A4 PDF
+async function renderTextToPdfBuffer(rawText) {
+  const pdfDoc = await PDFDocument.create();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
-  try {
-    if (fs.existsSync(pythonExe)) {
-      await execFileAsync(pythonExe, ['-c', pyCode], { timeout: 30000 });
-      if (fs.existsSync(outPath)) {
-        const pdfBytes = fs.readFileSync(outPath);
-        return pdfBytes;
+  let text = (rawText || '').replace(/^\uFEFF/, '');
+  text = text
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2013\u2014]/g, '-')
+    .replace(/\u2026/g, '...')
+    .replace(/[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF]/g, ' ');
+
+  const rawLines = text.split(/\r?\n/);
+  let page = pdfDoc.addPage([595.28, 841.89]); // A4
+  let y = 790;
+  const margin = 50;
+  const fontSize = 10.5;
+  const lineHeight = 15;
+  const maxWidth = 595.28 - margin * 2;
+
+  for (const rawLine of rawLines) {
+    if (!rawLine.trim()) {
+      y -= lineHeight;
+      if (y < margin) {
+        page = pdfDoc.addPage([595.28, 841.89]);
+        y = 790;
+      }
+      continue;
+    }
+
+    const words = rawLine.split(' ');
+    let line = '';
+    for (const word of words) {
+      const testLine = line ? `${line} ${word}` : word;
+      const textWidth = font.widthOfTextAtSize(testLine, fontSize);
+      if (textWidth > maxWidth && line) {
+        if (y < margin) {
+          page = pdfDoc.addPage([595.28, 841.89]);
+          y = 790;
+        }
+        page.drawText(line, { x: margin, y, size: fontSize, font, color: rgb(0.12, 0.12, 0.12) });
+        y -= lineHeight;
+        line = word;
+      } else {
+        line = testLine;
       }
     }
-  } catch (err) {
-    console.warn('Python docx2pdf failed, falling back:', err.message);
-  } finally {
-    try { if (fs.existsSync(inPath)) fs.unlinkSync(inPath); } catch (e) {}
-    try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (e) {}
+    if (line) {
+      if (y < margin) {
+        page = pdfDoc.addPage([595.28, 841.89]);
+        y = 790;
+      }
+      page.drawText(line, { x: margin, y, size: fontSize, font, color: rgb(0.12, 0.12, 0.12) });
+      y -= lineHeight;
+    }
   }
 
-  // Fallback: extract text and create PDF
-  const pdfDoc = await PDFDocument.create();
-  const page = pdfDoc.addPage([595.28, 841.89]);
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  page.drawText("Document converted from DOCX", { x: 50, y: 800, size: 14, font, color: rgb(0.1, 0.1, 0.1) });
   return Buffer.from(await pdfDoc.save());
 }
 
-// Helper: Python execution for pdf2docx
-async function convertPdfToDocx(pdfBuffer) {
-  const tempDir = os.tmpdir();
-  const uniqueId = `pdf_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  const inPath = path.join(tempDir, `${uniqueId}.pdf`);
-  const outPath = path.join(tempDir, `${uniqueId}.docx`);
-  fs.writeFileSync(inPath, pdfBuffer);
-
+// Helper: Convert DOCX to PDF (Python docx2pdf on Windows if available, pure Node mammoth + pdf-lib everywhere)
+async function convertDocxToPdf(docxBuffer) {
   const pythonExe = path.join(__dirname, 'venv', 'Scripts', 'python.exe');
-  const pyCode = `
+  if (fs.existsSync(pythonExe)) {
+    const tempDir = os.tmpdir();
+    const uniqueId = `docx_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const inPath = path.join(tempDir, `${uniqueId}.docx`);
+    const outPath = path.join(tempDir, `${uniqueId}.pdf`);
+    fs.writeFileSync(inPath, docxBuffer);
+
+    const pyCode = `
+from docx2pdf import convert
+convert(r"${inPath.replace(/\\/g, '\\\\')}", r"${outPath.replace(/\\/g, '\\\\')}")
+    `.trim();
+
+    try {
+      await execFileAsync(pythonExe, ['-c', pyCode], { timeout: 30000 });
+      if (fs.existsSync(outPath)) {
+        return fs.readFileSync(outPath);
+      }
+    } catch (err) {
+      console.warn('Python docx2pdf fallback to mammoth:', err.message);
+    } finally {
+      try { if (fs.existsSync(inPath)) fs.unlinkSync(inPath); } catch (e) {}
+      try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (e) {}
+    }
+  }
+
+  // Cross-platform pure Node.js conversion using mammoth + pdf-lib
+  const result = await mammoth.extractRawText({ buffer: docxBuffer });
+  const text = result.value && result.value.trim()
+    ? result.value
+    : 'Document converted from DOCX (empty text content).';
+  return await renderTextToPdfBuffer(text);
+}
+
+// Helper: Convert PDF to DOCX (Python pdf2docx if available, pure Node pdfreader + docx everywhere)
+async function convertPdfToDocx(pdfBuffer) {
+  const pythonExe = path.join(__dirname, 'venv', 'Scripts', 'python.exe');
+  if (fs.existsSync(pythonExe)) {
+    const tempDir = os.tmpdir();
+    const uniqueId = `pdf_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const inPath = path.join(tempDir, `${uniqueId}.pdf`);
+    const outPath = path.join(tempDir, `${uniqueId}.docx`);
+    fs.writeFileSync(inPath, pdfBuffer);
+
+    const pyCode = `
 from pdf2docx import Converter
 cv = Converter(r"${inPath.replace(/\\/g, '\\\\')}")
 cv.convert(r"${outPath.replace(/\\/g, '\\\\')}")
 cv.close()
-  `.trim();
+    `.trim();
 
-  try {
-    if (fs.existsSync(pythonExe)) {
+    try {
       await execFileAsync(pythonExe, ['-c', pyCode], { timeout: 30000 });
       if (fs.existsSync(outPath)) {
-        const docxBytes = fs.readFileSync(outPath);
-        return docxBytes;
+        return fs.readFileSync(outPath);
       }
+    } catch (err) {
+      console.warn('Python pdf2docx fallback to pure Node docx:', err.message);
+    } finally {
+      try { if (fs.existsSync(inPath)) fs.unlinkSync(inPath); } catch (e) {}
+      try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (e) {}
     }
-  } catch (err) {
-    console.warn('Python pdf2docx failed, falling back to pdfreader:', err.message);
-  } finally {
-    try { if (fs.existsSync(inPath)) fs.unlinkSync(inPath); } catch (e) {}
-    try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (e) {}
   }
 
-  // Fallback via pdfreader
-  const { PdfReader } = require("pdfreader");
+  // Cross-platform pure Node.js binary .docx generation using pdfreader + docx
+  const { PdfReader } = require('pdfreader');
   const extractedText = await new Promise((resolve, reject) => {
-    let textContent = "";
+    let textContent = '';
     let lastY = null;
     new PdfReader().parseBuffer(pdfBuffer, (err, item) => {
       if (err) reject(err);
-      else if (!item) resolve(textContent.trim() || "No text content found in PDF.");
+      else if (!item) resolve(textContent.trim() || 'No extractable text found in PDF.');
       else if (item.text) {
-        if (lastY !== null && Math.abs(item.y - lastY) > 0.5) textContent += "\n";
-        textContent += item.text + " ";
+        if (lastY !== null && Math.abs(item.y - lastY) > 0.5) textContent += '\n';
+        textContent += item.text + ' ';
         lastY = item.y;
       }
     });
   });
-  
-  const htmlContent = `<!DOCTYPE html><html><body>${extractedText.split('\n').map(l => `<p>${l.trim()}</p>`).join('')}</body></html>`;
-  return Buffer.from(htmlContent, 'utf-8');
+
+  const paragraphs = extractedText
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => new Paragraph({
+      children: [new TextRun({ text: line, size: 22 })],
+      spacing: { after: 120 }
+    }));
+
+  const doc = new Document({
+    sections: [{
+      properties: {},
+      children: paragraphs.length > 0 ? paragraphs : [new Paragraph('Empty PDF document.')]
+    }]
+  });
+
+  return await Packer.toBuffer(doc);
 }
 
 // Main Conversion Handler
@@ -214,7 +320,7 @@ app.post('/api/convert', upload.any(), async (req, res) => {
         convertedBuffer = await sharp(buffer).webp({ quality: 85 }).toBuffer();
         mimeType = 'image/webp';
       }
-    } 
+    }
     // 2. Image to PDF
     else if (targetFormat === 'img-to-pdf') {
       newExtension = 'pdf';
@@ -237,7 +343,7 @@ app.post('/api/convert', upload.any(), async (req, res) => {
       page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
       convertedBuffer = Buffer.from(await pdfDoc.save());
       mimeType = 'application/pdf';
-    } 
+    }
     // 3. OCR (Text Extraction)
     else if (targetFormat === 'ocr') {
       if (!['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'].includes(extension)) {
@@ -247,8 +353,8 @@ app.post('/api/convert', upload.any(), async (req, res) => {
       const Tesseract = require('tesseract.js');
       const { data: { text } } = await Tesseract.recognize(buffer, 'eng');
       convertedBuffer = Buffer.from(text || 'No text recognized.', 'utf-8');
-      mimeType = 'text/plain';
-    } 
+      mimeType = 'text/plain; charset=utf-8';
+    }
     // 4. Compress PDF
     else if (targetFormat === 'compress-pdf') {
       if (extension !== '.pdf') {
@@ -258,7 +364,7 @@ app.post('/api/convert', upload.any(), async (req, res) => {
       const pdfDoc = await PDFDocument.load(buffer, { ignoreEncryption: true });
       convertedBuffer = Buffer.from(await pdfDoc.save({ useObjectStreams: true }));
       mimeType = 'application/pdf';
-    } 
+    }
     // 5. PDF to DOCX
     else if (targetFormat === 'pdf-to-docx') {
       if (extension !== '.pdf') {
@@ -267,7 +373,7 @@ app.post('/api/convert', upload.any(), async (req, res) => {
       newExtension = 'docx';
       convertedBuffer = await convertPdfToDocx(buffer);
       mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-    } 
+    }
     // 6. DOCX to PDF
     else if (targetFormat === 'docx-to-pdf') {
       if (!['.docx', '.doc'].includes(extension)) {
@@ -276,72 +382,17 @@ app.post('/api/convert', upload.any(), async (req, res) => {
       newExtension = 'pdf';
       convertedBuffer = await convertDocxToPdf(buffer);
       mimeType = 'application/pdf';
-    } 
+    }
     // 7. TXT to PDF
     else if (targetFormat === 'txt-to-pdf') {
       newExtension = 'pdf';
-      const pdfDoc = await PDFDocument.create();
-      const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-      let text = buffer.toString('utf-8').replace(/^\uFEFF/, '');
-      // Sanitize special unicode characters not representable in WinAnsi
-      text = text
-        .replace(/[\u2018\u2019]/g, "'")
-        .replace(/[\u201C\u201D]/g, '"')
-        .replace(/[\u2013\u2014]/g, '-')
-        .replace(/\u2026/g, '...')
-        .replace(/[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF]/g, ' ');
-      const rawLines = text.split(/\r?\n/);
-
-      let page = pdfDoc.addPage([595.28, 841.89]); // A4
-      let y = 790;
-      const margin = 50;
-      const fontSize = 10.5;
-      const lineHeight = 15;
-      const maxWidth = 595.28 - margin * 2;
-
-      for (let rawLine of rawLines) {
-        if (!rawLine.trim()) {
-          y -= lineHeight;
-          if (y < margin) {
-            page = pdfDoc.addPage([595.28, 841.89]);
-            y = 790;
-          }
-          continue;
-        }
-
-        const words = rawLine.split(' ');
-        let line = '';
-        for (const word of words) {
-          const testLine = line ? `${line} ${word}` : word;
-          const textWidth = font.widthOfTextAtSize(testLine, fontSize);
-          if (textWidth > maxWidth) {
-            if (y < margin) {
-              page = pdfDoc.addPage([595.28, 841.89]);
-              y = 790;
-            }
-            page.drawText(line, { x: margin, y, size: fontSize, font, color: rgb(0.12, 0.12, 0.12) });
-            y -= lineHeight;
-            line = word;
-          } else {
-            line = testLine;
-          }
-        }
-        if (line) {
-          if (y < margin) {
-            page = pdfDoc.addPage([595.28, 841.89]);
-            y = 790;
-          }
-          page.drawText(line, { x: margin, y, size: fontSize, font, color: rgb(0.12, 0.12, 0.12) });
-          y -= lineHeight;
-        }
-      }
-
-      convertedBuffer = Buffer.from(await pdfDoc.save());
+      const text = buffer.toString('utf-8');
+      convertedBuffer = await renderTextToPdfBuffer(text);
       mimeType = 'application/pdf';
-    } 
+    }
     // 8. Merge Multiple PDFs
     else if (targetFormat === 'merge-pdf') {
-      const pdfFiles = uploadedFiles.filter(f => 
+      const pdfFiles = uploadedFiles.filter(f =>
         f.originalname.toLowerCase().endsWith('.pdf') || f.mimetype === 'application/pdf'
       );
       if (pdfFiles.length < 2) {
@@ -357,7 +408,7 @@ app.post('/api/convert', upload.any(), async (req, res) => {
       }
       convertedBuffer = Buffer.from(await mergedDoc.save());
       mimeType = 'application/pdf';
-    } 
+    }
     // 9. Split PDF Pages (Returns ZIP containing each page)
     else if (targetFormat === 'split-pdf') {
       if (extension !== '.pdf') {
@@ -399,7 +450,11 @@ app.post('/api/convert', upload.any(), async (req, res) => {
     const uniqueFilename = `${Date.now()}_${newFileName}`;
     const filePath = path.join(downloadsDir, uniqueFilename);
     fs.writeFileSync(filePath, convertedBuffer);
-    const previewUrl = `http://localhost:3001/downloads/${uniqueFilename}`;
+
+    // Dynamic public preview URL derived from the incoming request (never hardcodes localhost in production)
+    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim();
+    const host = req.headers['x-forwarded-host'] || req.get('host') || `localhost:${PORT}`;
+    const previewUrl = `${proto}://${host}/downloads/${encodeURIComponent(uniqueFilename)}`;
 
     res.set({
       'Content-Type': mimeType,
@@ -415,7 +470,7 @@ app.post('/api/convert', upload.any(), async (req, res) => {
   }
 });
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Conversion server running on port ${PORT}`);
 });

@@ -19,6 +19,8 @@ import { Link } from 'react-router-dom';
 import { auth, db } from '../firebase';
 import { onAuthStateChanged } from 'firebase/auth';
 import { collection, query, orderBy, limit, onSnapshot, doc, deleteDoc, updateDoc } from 'firebase/firestore';
+import PreviewModal from './PreviewModal';
+import { getSessionPreview, resolveSafePreviewUrl } from '../utils/previewHelper';
 
 const QUICK_TOOLS = [
   { tool: 'pdf-to-docx', name: 'PDF to Word (DOCX)', icon: FileText, category: 'PDF' },
@@ -33,6 +35,9 @@ const DashboardPreview = () => {
   const [conversions, setConversions] = useState([]);
   const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('Recent');
+  const [previewModalOpen, setPreviewModalOpen] = useState(false);
+  const [previewModalData, setPreviewModalData] = useState(null);
+  const [previewNotice, setPreviewNotice] = useState('');
 
   const loadLocalConversions = () => {
     if (!auth.currentUser) {
@@ -102,11 +107,51 @@ const DashboardPreview = () => {
     }
   };
 
-  const handlePreview = (file) => {
-    if (file.url) {
-      window.open(file.url, '_blank');
-    } else {
-      alert('For your privacy and security, converted files are automatically deleted from server memory once downloaded. Preview is available immediately upon conversion.');
+  const handlePreview = async (file) => {
+    setPreviewNotice('');
+
+    // 1. Check in-memory session cache first (works across devices without server roundtrip)
+    const cached = getSessionPreview(file.date);
+    if (cached && cached.url) {
+      setPreviewModalData(cached);
+      setPreviewModalOpen(true);
+      return;
+    }
+
+    // 2. Sanitize URL so stale localhost:3001 URLs are rewritten or blocked safely
+    const safeUrl = resolveSafePreviewUrl(file.url);
+    if (!safeUrl) {
+      setPreviewNotice('For your privacy and security, files from previous sessions are purged automatically. Please re-convert the file to preview.');
+      setTimeout(() => setPreviewNotice(''), 5000);
+      return;
+    }
+
+    // 3. Check if remote ephemeral file exists before opening modal
+    try {
+      const res = await fetch(safeUrl, { method: 'HEAD' });
+      if (!res.ok) {
+        setPreviewNotice('This preview file has expired from temporary server storage. Please re-convert the file to preview or download.');
+        setTimeout(() => setPreviewNotice(''), 5000);
+        return;
+      }
+      const contentType = res.headers.get('Content-Type') || '';
+      let textContent = '';
+      if (contentType.startsWith('text/') || safeUrl.toLowerCase().endsWith('.txt')) {
+        const textRes = await fetch(safeUrl);
+        textContent = await textRes.text();
+      }
+      const ext = (file.to || '').toLowerCase();
+      const baseName = file.name.replace(/\.[^/.]+$/, '');
+      setPreviewModalData({
+        url: safeUrl,
+        filename: `${baseName}_converted.${ext || 'file'}`,
+        type: contentType,
+        textContent
+      });
+      setPreviewModalOpen(true);
+    } catch (e) {
+      setPreviewNotice('Unable to load preview for this archived conversion. Please re-convert to preview.');
+      setTimeout(() => setPreviewNotice(''), 5000);
     }
   };
 
@@ -167,6 +212,20 @@ const DashboardPreview = () => {
 
         {/* Content based on Active Tab */}
         <div className="dashboard-content-area">
+          {previewNotice && (
+            <div style={{
+              marginBottom: '16px',
+              padding: '12px 16px',
+              borderRadius: '12px',
+              background: '#FEF3C7',
+              border: '1px solid #FDE68A',
+              color: '#92400E',
+              fontSize: '0.875rem',
+              fontWeight: 500
+            }}>
+              {previewNotice}
+            </div>
+          )}
           {activeTab === 'All Tools' ? (
             <div className="tools-grid-view">
               <div className="tools-grid-header">
@@ -258,7 +317,7 @@ const DashboardPreview = () => {
                       </div>
 
                       <div className="row-actions">
-                        {file.url && (
+                        {(getSessionPreview(file.date) || resolveSafePreviewUrl(file.url)) && (
                           <button 
                             className="btn-row-action"
                             title="Preview file"
@@ -292,6 +351,12 @@ const DashboardPreview = () => {
           )}
         </div>
       </div>
+
+      <PreviewModal
+        isOpen={previewModalOpen}
+        onClose={() => setPreviewModalOpen(false)}
+        previewData={previewModalData}
+      />
 
       <style>{`
         .workspace-section {
